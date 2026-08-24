@@ -80,16 +80,30 @@ class ReplayBuffer:
 
 class MemoryEfficientReplayBuffer:
     """
-    A memory-efficient version of the replay buffer for when observations are stacked.
+    用于帧堆叠（frame stacking）观测的内存高效经验回放池。
+
+    普通回放池会为每条 transition 分别保存 ``observation`` 与
+    ``next_observation``。当一个观测由连续 ``frame_history_len`` 帧组成时，
+    相邻 transition 中的大部分图像帧都重复，存储开销会很大。
+
+    本类只在 ``framebuffer`` 中保存每一张原始二维 ``uint8`` 图像；每条
+    transition 则保存两组帧索引，分别用来重建当前观测和下一观测。因此：
+
+    * ``on_reset(first_frame)`` 开始一个新轨迹并写入其第一帧；
+    * ``insert(action, reward, next_frame, done)`` 写入一条 transition 及其
+      唯一新增的下一帧；
+    * ``sample`` 根据保存的索引从帧缓冲区取回完整的堆叠观测。
+
+    同一 episode 开头不足的历史帧会重复该 episode 的第一帧，而不会借用
+    上一个 episode 的图像帧。
     """
 
     def __init__(self, frame_history_len: int, capacity=1000000):
         self.max_size = capacity
 
-        # Technically we need max_size*2 to support both obs and next_obs.
-        # Otherwise we'll end up overwriting old observations' frames, but the
-        # corresponding next_observation_framebuffer_idcs will still point to the old frames.
-        # (It's okay though because the unused data will be paged out)
+        # 一条 transition 最多引入一张初始帧和一张下一帧。帧缓冲区因此保留
+        # 2 * capacity 个槽位，避免回放环形数组覆盖旧 transition 时，其仍在
+        # 使用的帧索引过早被覆盖。（未实际使用的页通常不会常驻物理内存。）
         self.max_framebuffer_size = 2 * capacity
 
         self.frame_history_len = frame_history_len
@@ -98,22 +112,33 @@ class MemoryEfficientReplayBuffer:
         self.rewards = None
         self.dones = None
 
+        # 每行是一个长度为 frame_history_len 的索引序列；用它从 framebuffer
+        # 还原形如 (history, H, W) 的 observation / next_observation。
         self.observation_framebuffer_idcs = None
         self.next_observation_framebuffer_idcs = None
+        # 只存不重复的单帧图像，索引由 framebuffer_idx 单调递增地产生。
         self.framebuffer = None
         self.observation_shape = None
 
+        # 当前 episode 的起点。前者位于 transition 环形缓冲区的逻辑坐标中，
+        # 后者位于帧缓冲区的逻辑坐标中，后者用于阻止帧历史跨 episode。
         self.current_trajectory_begin = None
         self.current_trajectory_framebuffer_begin = None
         self.framebuffer_idx = None
 
+        # 尚未作为一条 transition 的 observation 写入索引表的最新堆叠观测；
+        # 它会在下一次 insert 时成为该 transition 的 observation。
         self.recent_observation_framebuffer_idcs = None
 
     def sample(self, batch_size):
+        # transition 数组是容量为 max_size 的环形数组；size 超过容量后，
+        # 对逻辑下标取模可得到实际存储槽位。
         rand_indices = (
             np.random.randint(0, self.size, size=(batch_size,)) % self.max_size
         )
 
+        # 帧索引同样是逻辑上的单调递增编号。取模将它们映射到实际的环形
+        # framebuffer 槽位；NumPy 高级索引会直接返回整个帧历史。
         observation_framebuffer_idcs = (
             self.observation_framebuffer_idcs[rand_indices] % self.max_framebuffer_size
         )
@@ -144,6 +169,8 @@ class MemoryEfficientReplayBuffer:
         ), "Single-frame observation should have dimensions (H, W)"
         assert frame.dtype == np.uint8, "Observation should be uint8 (0-255)"
 
+        # framebuffer_idx 指向当前要写入的位置；返回值同时作为该帧的逻辑
+        # 索引，供 observation / next_observation 的索引表引用。
         self.framebuffer[self.framebuffer_idx] = frame
         frame_idx = self.framebuffer_idx
         self.framebuffer_idx = self.framebuffer_idx + 1
@@ -159,6 +186,9 @@ class MemoryEfficientReplayBuffer:
 
         Indices are into the observation buffer, not the regular buffers.
         """
+        # 例如历史长度为 4、latest 为 12 时，候选序列是 [9, 10, 11, 12]。
+        # 对每个索引下限截断到本轨迹第一帧，就会在 episode 开头重复第一帧，
+        # 既保持固定堆叠长度，也避免历史穿越 episode 边界。
         return np.maximum(
             np.arange(-self.frame_history_len + 1, 1) + latest_framebuffer_idx,
             trajectory_begin_framebuffer_idx,
@@ -170,7 +200,10 @@ class MemoryEfficientReplayBuffer:
         observation: np.ndarray,
     ):
         """
-        Call this with the first observation of a new episode.
+        在新 episode 的第一张原始观测到达时调用。
+
+        这不是一条 transition：它只记录初始图像以及当前 episode 的边界；
+        第一次 ``insert`` 才会用该图像作为 observation 创建 transition。
         """
         assert (
             observation.ndim == 2
@@ -196,11 +229,13 @@ class MemoryEfficientReplayBuffer:
             self.current_trajectory_begin = 0
             self.current_trajectory_framebuffer_begin = 0
 
+        # size 使用逻辑计数而非环形槽位。该值主要标记 episode 的 transition
+        # 起点，帧堆叠本身以紧随其后的 framebuffer 起点作为边界。
         self.current_trajectory_begin = self.size
 
-        # Insert the observation.
+        # 写入 episode 第一帧，并为即将到来的第一条 transition 准备其
+        # observation 索引。此时历史不足的部分会全部指向该第一帧。
         self.current_trajectory_framebuffer_begin = self._insert_frame(observation)
-        # Compute, but don't store until we have a next observation.
         self.recent_observation_framebuffer_idcs = self._compute_frame_history_idcs(
             self.current_trajectory_framebuffer_begin,
             self.current_trajectory_framebuffer_begin,
@@ -215,11 +250,15 @@ class MemoryEfficientReplayBuffer:
         done: np.ndarray,
     ):
         """
-        Insert a single transition into the replay buffer.
+        插入当前 episode 的一条 transition。
+
+        调用前，``recent_observation_framebuffer_idcs`` 指向当前状态的帧堆叠；
+        调用时传入其唯一新增的 ``next_observation`` 单帧。方法会依次保存当前
+        状态索引、标量/动作数据、下一状态索引，并让下一状态成为下一步的当前
+        状态。
 
         Use like:
             replay_buffer.insert(
-                observation=observation,
                 action=action,
                 reward=reward,
                 next_observation=next_observation,
@@ -248,6 +287,8 @@ class MemoryEfficientReplayBuffer:
         assert next_observation.shape == self.observation_shape
         assert done.shape == ()
 
+        # transition 元数据使用 max_size 的环形槽位；写入前先保存当前状态的
+        # 帧历史索引，因为随后会写入下一状态的最后一帧。
         self.observation_framebuffer_idcs[
             self.size % self.max_size
         ] = self.recent_observation_framebuffer_idcs
@@ -255,9 +296,11 @@ class MemoryEfficientReplayBuffer:
         self.rewards[self.size % self.max_size] = reward
         self.dones[self.size % self.max_size] = done
 
+        # 写入下一状态唯一新增的图像帧；相邻 transition 会复用此前已保存的
+        # 历史帧，而无需重复写入它们。
         next_frame_idx = self._insert_frame(next_observation)
 
-        # Compute indices for the next observation.
+        # 下一状态仍受本 episode 首帧约束，因而 episode 起始处会进行首帧填充。
         next_framebuffer_idcs = self._compute_frame_history_idcs(
             next_frame_idx, self.current_trajectory_framebuffer_begin
         )
@@ -267,6 +310,6 @@ class MemoryEfficientReplayBuffer:
 
         self.size += 1
 
-        # Set up the observation for the next step.
-        # This won't be sampled yet, and it will be overwritten if we start a new episode.
+        # 为下一次 insert 缓存当前的 next_observation。它暂未对应已完成的
+        # transition；若环境终止并调用 on_reset，会被新 episode 的首帧索引替换。
         self.recent_observation_framebuffer_idcs = next_framebuffer_idcs

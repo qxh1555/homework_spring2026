@@ -15,7 +15,7 @@ from configs.schedule import (
 )
 from infrastructure import pytorch_util as ptu
 from networks.critics import DQNCritic
-
+ 
 
 def basic_dqn_config(
     env_name: str,
@@ -107,7 +107,7 @@ def atari_dqn_config(
     clip_grad_norm: Optional[float] = 10.0,
     use_double_q: bool = False,
     learning_starts: int = 20000,
-    batch_size: int = 32,
+    batch_size: int = 32,  
     **kwargs,
 ):
     def make_critic(observation_shape: Tuple[int, ...], num_actions: int) -> nn.Module:

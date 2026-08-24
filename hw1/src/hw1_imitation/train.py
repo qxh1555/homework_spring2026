@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from posixpath import sep
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,7 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger,evaluate_policy
 
 LOGDIR_PREFIX = "exp"
 
@@ -118,6 +119,8 @@ def run_training(config: TrainConfig) -> None:
         hidden_dims=config.hidden_dims,
     ).to(device)
 
+    model = torch.compile(model)  
+
     exp_name = f"seed_{config.seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if config.exp_name is not None:
         exp_name += f"_{config.exp_name}"
@@ -126,9 +129,41 @@ def run_training(config: TrainConfig) -> None:
         project=config.wandb_project, config=config_to_dict(config), name=exp_name
     )
     logger = Logger(log_dir)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+    global_step = 0
+    for epoch in range(config.num_epochs):
+        for step, (state, action_chunk) in enumerate(loader):
+            state = state.to(device)
+            action_chunk = action_chunk.to(device)
 
-    ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
+            loss = model.compute_loss(state, action_chunk)
 
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if  (global_step+step) % config.log_interval == 0:
+                logger.log({"train/loss": loss.item()}, global_step+step)
+
+            if  (global_step+step) % config.eval_interval == 0:
+                evaluate_policy(
+                    model,
+                    normalizer,
+                    device,
+                    chunk_size=config.chunk_size,
+                    video_size=config.video_size,
+                    num_video_episodes=config.num_video_episodes,
+                    flow_num_steps=config.flow_num_steps,
+                    step=global_step+step,
+                    logger=logger,
+                )
+        global_step += len(loader)
+
+    
     logger.dump_for_grading()
 
 

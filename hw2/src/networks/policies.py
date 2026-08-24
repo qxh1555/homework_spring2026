@@ -1,4 +1,5 @@
 import itertools
+from statistics import mean
 from torch import nn
 from torch.nn import functional as F
 import torch.distributions as D
@@ -59,10 +60,9 @@ class MLPPolicy(nn.Module):
     @torch.no_grad()
     def get_action(self, obs: np.ndarray) -> np.ndarray:
         """Takes a single observation (as a numpy array) and returns a single action (as a numpy array)."""
-        # TODO: implement get_action
-        action = None
-
-        return action
+        obs = ptu.from_numpy(obs)
+        action = self.forward(obs).sample()
+        return ptu.to_numpy(action)
 
     def forward(self, obs: torch.FloatTensor):
         """
@@ -71,18 +71,20 @@ class MLPPolicy(nn.Module):
         flexible objects, such as a `torch.distributions.Distribution` object. It's up to you!
         """
         if self.discrete:
-            # TODO: define the forward pass for a policy with a discrete action space.
-            pass
+            logits = self.logits_net(obs)
+            return distributions.Categorical(logits=logits)
         else:
             # TODO: define the forward pass for a policy with a continuous action space.
-            pass
+            mean = self.mean_net(obs)
+            std = torch.exp(self.logstd)
+            return distributions.Independent(distributions.Normal(mean, std),1,)
 
     def update(self, obs: np.ndarray, actions: np.ndarray, *args, **kwargs) -> dict:
         """
         Performs one iteration of gradient descent on the provided batch of data. You don't need to implement this
         method in the base class, but you do need to implement it in the subclass.
         """
-        raise NotImplementedError
+        pass
 
 
 class MLPPolicyPG(MLPPolicy):
@@ -100,10 +102,14 @@ class MLPPolicyPG(MLPPolicy):
         advantages = ptu.from_numpy(advantages)
 
         # TODO: compute the policy gradient actor loss
-        loss = None
+        dist = self.forward(obs).log_prob(actions)  
+        print("dist shape:", dist.shape)
+        print("advantages shape:", advantages.shape)
+        loss = (-dist * advantages).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-        # TODO: perform an optimizer step
-        pass
 
         return {
             "Actor Loss": loss.item(),
