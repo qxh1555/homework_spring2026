@@ -47,8 +47,14 @@ class DQNAgent(nn.Module):
         """
         observation = ptu.from_numpy(np.asarray(observation))[None]
 
-        # TODO(Section 2.4): get the action from the critic using an epsilon-greedy strategy
-        action = None
+        # FTODO(Section 2.4): get the action from the critic using an epsilon-greedy strategy
+        # FTODO represents finished TODOs, which are already implemented in the code below.
+        q_values = self.critic(observation)
+        random_value = np.random.rand(0,1,(1,))
+        if random_value < epsilon:
+            action = np.random.randint(0, self.num_actions)
+        else:
+            action = q_values.argmax(dim=-1)
         # ENDTODO
 
         return ptu.to_numpy(action).squeeze(0).item()
@@ -71,21 +77,22 @@ class DQNAgent(nn.Module):
 
             if self.use_double_q:
                 # TODO(Section 2.5): implement double-Q target action selection
-                next_action = None
+                next_action = self.critic(next_obs).argmax(dim=-1)
             else:
-                next_action = None
+                next_action = self.target_critic(next_obs).argmax(dim=-1)
 
-            next_q_values = None
+            next_q_values = self.target_critic(next_obs)
             assert next_q_values.shape == (batch_size,), next_q_values.shape
 
-            target_values = None
+            target_values = reward + self.discount * (1 - done) * next_q_values.gather(1, next_action.unsqueeze(-1)).squeeze(-1)
             assert target_values.shape == (batch_size,), target_values.shape
             # ENDTODO
 
         # TODO(Section 2.4): train the critic with the target values
-        qa_values = None
-        q_values = None
-        loss = None
+        q_values = self.critic(obs)
+        qa_values = q_values.gather(1, action.unsqueeze(-1)).squeeze(-1)
+
+        loss = self.critic_loss(qa_values, target_values)
         # ENDTODO
 
         self.critic_optimizer.zero_grad()
@@ -121,7 +128,10 @@ class DQNAgent(nn.Module):
         """
         # TODO(Section 2.4): update the critic, and the target if needed
         critic_stats = None
+
         # Hint: if step % self.target_update_period == 0: ...
+        if step % self.target_update_period == 0:
+            self.update_target_critic()
         # ENDTODO
 
         return critic_stats
