@@ -50,13 +50,14 @@ class DQNAgent(nn.Module):
         # FTODO(Section 2.4): get the action from the critic using an epsilon-greedy strategy
         # FTODO represents finished TODOs, which are already implemented in the code below.
         q_values = self.critic(observation)
-        random_value = np.random.rand(0,1,(1,))
+        random_value = np.random.rand(1)
         if random_value < epsilon:
-            action = np.random.randint(0, self.num_actions)
+            action = ptu.from_numpy(np.random.randint(0, self.num_actions, size=1))[None]
         else:
             action = q_values.argmax(dim=-1)
         # ENDTODO
-
+        #print(action.shape)
+        #print(action.type())
         return ptu.to_numpy(action).squeeze(0).item()
 
     def update_critic(
@@ -81,10 +82,10 @@ class DQNAgent(nn.Module):
             else:
                 next_action = self.target_critic(next_obs).argmax(dim=-1)
 
-            next_q_values = self.target_critic(next_obs)
-            assert next_q_values.shape == (batch_size,), next_q_values.shape
+            next_q_values = self.target_critic(next_obs).gather(1, next_action.unsqueeze(-1)).squeeze(-1)
+            assert next_q_values.shape == (batch_size,), next_q_values.shape #err:
 
-            target_values = reward + self.discount * (1 - done) * next_q_values.gather(1, next_action.unsqueeze(-1)).squeeze(-1)
+            target_values = reward + self.discount *  ~done * next_q_values #err:RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported. If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.
             assert target_values.shape == (batch_size,), target_values.shape
             # ENDTODO
 
@@ -94,15 +95,13 @@ class DQNAgent(nn.Module):
 
         loss = self.critic_loss(qa_values, target_values)
         # ENDTODO
-
-        self.critic_optimizer.zero_grad()
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(
-            self.critic.parameters(), self.clip_grad_norm or float("inf")
-        )
-        self.critic_optimizer.step()
-
-        self.lr_scheduler.step()
+        with torch.no_grad():
+            self.critic_optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(
+            self.critic.parameters(), self.clip_grad_norm or float("inf"))
+            self.critic_optimizer.step()
+            self.lr_scheduler.step()
 
         return {
             "critic_loss": loss.item(),
@@ -127,7 +126,7 @@ class DQNAgent(nn.Module):
         Update the DQN agent, including both the critic and target.
         """
         # TODO(Section 2.4): update the critic, and the target if needed
-        critic_stats = None
+        critic_stats = self.update_critic(obs,action,reward,next_obs,done)
 
         # Hint: if step % self.target_update_period == 0: ...
         if step % self.target_update_period == 0:
